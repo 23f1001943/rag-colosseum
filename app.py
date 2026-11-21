@@ -1,15 +1,14 @@
 
 import json
 import re
+import math
 from pathlib import Path
-from typing import Optional
+from collections import Counter
 
-import numpy as np
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from sentence_transformers import SentenceTransformer
-from rank_bm25 import BM25Okapi
+from typing import Optional
 
 
 # --------------------------------------------------
@@ -23,56 +22,258 @@ with open(KB_PATH, "r", encoding="utf-8") as file:
     passages = json.load(file)
 
 if not isinstance(passages, list) or not passages:
-    raise ValueError("knowledge_base.json must contain a non-empty JSON list.")
+    raise ValueError("Knowledge base must be a non-empty JSON list.")
 
 if not all(isinstance(p, str) for p in passages):
-    raise ValueError("Every knowledge-base passage must be a string.")
+    raise ValueError("Every passage must be a string.")
+
+print(f"Loaded {len(passages)} passages.")
 
 
 # --------------------------------------------------
-# 2. Load the embedding model and build the index
+# 2. Tokenization
 # --------------------------------------------------
 
-print("Loading embedding model...")
+def tokenize(text):
+    return re.findall(r"[a-z0-9]+(?:[.-][a-z0-9]+)*", text.lower())
 
-model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
-print("Creating passage embeddings...")
+# Remove common words that do not help retrieval
+STOPWORDS = {
+    "the", "is", "are", "was", "were", "a", "an",
+    "and", "or", "of", "to", "in", "on", "for",
+    "with", "by", "what", "which", "who", "when",
+    "where", "how", "does", "do", "did", "can",
+    "could", "would", "should", "about", "from",
+    "that", "this", "it", "its", "their", "they",
+    "be", "as", "at", "than", "explain", "describe",
+    "tell", "me", "please", "give", "show"
+}
 
-passage_embeddings = model.encode(
-    passages,
-    convert_to_numpy=True,
-    normalize_embeddings=True
+
+def useful_tokens(text):
+    return [
+        token for token in tokenize(text)
+        if token not in STOPWORDS
+    ]
+
+
+# --------------------------------------------------
+# 3. Build a lightweight BM25 index
+# --------------------------------------------------
+
+N = len(passages)
+
+tokenized_passages = [
+    tokenize(passage) for passage in passages
+]
+
+document_lengths = [
+    len(tokens) for tokens in tokenized_passages
+]
+
+average_length = (
+    sum(document_lengths) / N if N else 0
 )
 
-# BM25 keyword index
-def tokenize(text: str):
-    return re.findall(r"[a-zA-Z0-9_.-]+", text.lower())
+# Document frequency for every token
+document_frequency = Counter()
+
+for tokens in tokenized_passages:
+    document_frequency.update(set(tokens))
 
 
-tokenized_passages = [tokenize(p) for p in passages]
-bm25 = BM25Okapi(tokenized_passages)
+def calculate_bm25(query):
+    query_tokens = useful_tokens(query)
 
-print(f"Loaded {len(passages)} passages successfully.")
+    if not query_tokens:
+        return [0.0] * N
+
+    k1 = 1.5
+    b = 0.75
+
+    scores = []
+
+    for doc_index, doc_tokens in enumerate(tokenized_passages):
+
+        term_counts = Counter(doc_tokens)
+        doc_length = document_lengths[doc_index]
+
+        score = 0.0
+
+        for term in query_tokens:
+
+            frequency = term_counts.get(term, 0)
+
+            if frequency == 0:
+                continue
+
+            df = document_frequency.get(term, 0)
+
+            # Positive inverse document frequency
+            idf = math.log(
+                1 + (N - df + 0.5) / (df + 0.5)
+            )
+
+            denominator = frequency + k1 * (
+                1 - b + b * doc_length / max(average_length, 1)
+            )
+
+            score += idf * (
+                frequency * (k1 + 1) / denominator
+            )
+
+        scores.append(score)
+
+    return scores
 
 
 # --------------------------------------------------
-# 3. Create the FastAPI application
+# 4. Retrieve relevant passages
 # --------------------------------------------------
 
-app = FastAPI(title="RAG Colosseum API")
+def retrieve(question, top_k):
+
+    raw_scores = calculate_bm25(question)
+
+    ranked_indices = sorted(
+        range(N),
+        key=lambda i: raw_scores[i],
+        reverse=True
+    )
+
+    selected = ranked_indices[:top_k]
+
+    results = []
+
+    for index in selected:
+
+        raw_score = raw_scores[index]
+
+        # Convert BM25 into a bounded score
+        normalized_score = raw_score / (raw_score + 3.0)
+
+        results.append({
+            "index": index,
+            "raw_score": raw_score,
+            "score": normalized_score
+        })
+
+    return results
+
+
+# --------------------------------------------------
+# 5. Extract answer sentences from retrieved passages
+# --------------------------------------------------
+
+def extract_answer(question, retrieved):
+
+    query_words = set(useful_tokens(question))
+
+    if not query_words:
+        return None, []
+
+    candidates = []
+
+    for item in retrieved:
+
+        passage_index = item["index"]
+        passage = passages[passage_index]
+
+        sentences = re.split(
+            r"(?<=[.!?])\s+",
+            passage.strip()
+        )
+
+        for sentence in sentences:
+
+            sentence_words = set(useful_tokens(sentence))
+
+            if not sentence_words:
+                continue
+
+            overlap = query_words.intersection(sentence_words)
+
+            if not overlap:
+                continue
+
+            coverage = len(overlap) / len(query_words)
+
+            # Score sentence relevance
+            sentence_score = (
+                0.75 * coverage +
+                0.25 * item["score"]
+            )
+
+            candidates.append({
+                "sentence": sentence.strip(),
+                "source": passage_index,
+                "coverage": coverage,
+                "score": sentence_score
+            })
+
+    if not candidates:
+        return None, []
+
+    candidates.sort(
+        key=lambda x: x["score"],
+        reverse=True
+    )
+
+    selected = []
+    seen = set()
+
+    for candidate in candidates:
+
+        sentence = candidate["sentence"]
+
+        if sentence.lower() in seen:
+            continue
+
+        # Require reasonable overlap with the question
+        if candidate["coverage"] < 0.45:
+            continue
+
+        selected.append(candidate)
+        seen.add(sentence.lower())
+
+        if len(selected) >= 3:
+            break
+
+    if not selected:
+        return None, []
+
+    answer = " ".join(
+        item["sentence"] for item in selected
+    )
+
+    supporting_sources = list(dict.fromkeys(
+        item["source"] for item in selected
+    ))
+
+    return answer, supporting_sources
+
+
+# --------------------------------------------------
+# 6. Create FastAPI application
+# --------------------------------------------------
+
+app = FastAPI(
+    title="RAG Colosseum API",
+    description="Lightweight retrieval-augmented question answering API"
+)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"]
 )
 
 
 # --------------------------------------------------
-# 4. Request and response formats
+# 7. Request and response formats
 # --------------------------------------------------
 
 class QueryRequest(BaseModel):
@@ -88,167 +289,7 @@ class QueryResponse(BaseModel):
 
 
 # --------------------------------------------------
-# 5. Hybrid retrieval: semantic + keyword search
-# --------------------------------------------------
-
-def retrieve(question: str, top_k: int):
-    # Semantic similarity
-    query_embedding = model.encode(
-        [question],
-        convert_to_numpy=True,
-        normalize_embeddings=True
-    )[0]
-
-    semantic_scores = np.dot(
-        passage_embeddings,
-        query_embedding
-    )
-
-    # Convert cosine similarities to the 0-1 range
-    semantic_scores = np.clip(
-        semantic_scores,
-        0.0,
-        1.0
-    )
-
-    # BM25 keyword scores
-    keyword_scores = np.array(
-        bm25.get_scores(tokenize(question)),
-        dtype=float
-    )
-
-    # Normalize BM25 scores
-    max_bm25 = float(keyword_scores.max())
-
-    if max_bm25 > 0:
-        keyword_scores = keyword_scores / max_bm25
-    else:
-        keyword_scores = np.zeros(len(passages))
-
-    # Combine both retrieval methods
-    combined_scores = (
-        0.70 * semantic_scores +
-        0.30 * keyword_scores
-    )
-
-    # Sort passage indices by descending score
-    ranked_indices = np.argsort(combined_scores)[::-1]
-
-    selected_indices = ranked_indices[:top_k]
-
-    results = [
-        {
-            "index": int(i),
-            "score": float(combined_scores[i])
-        }
-        for i in selected_indices
-    ]
-
-    return results
-
-
-# --------------------------------------------------
-# 6. Extract relevant sentences from retrieved passages
-# --------------------------------------------------
-
-STOPWORDS = {
-    "the", "is", "are", "was", "were", "a", "an", "and",
-    "or", "of", "to", "in", "on", "for", "with", "by",
-    "what", "which", "who", "when", "where", "how",
-    "does", "do", "did", "can", "could", "would",
-    "should", "about", "from", "that", "this", "it",
-    "its", "their", "they", "be", "as", "at", "than",
-    "between", "compare", "explain", "describe"
-}
-
-
-def important_words(text: str):
-    return {
-        word for word in tokenize(text)
-        if word not in STOPWORDS and len(word) > 1
-    }
-
-
-def extract_answer(question: str, retrieved):
-    query_words = important_words(question)
-
-    if not query_words:
-        return None
-
-    candidates = []
-
-    for item in retrieved:
-        passage_index = item["index"]
-        passage = passages[passage_index]
-
-        # Split each passage into individual sentences
-        sentences = re.split(r"(?<=[.!?])\s+", passage.strip())
-
-        for sentence in sentences:
-            sentence_words = important_words(sentence)
-
-            if not sentence_words:
-                continue
-
-            overlap = query_words.intersection(sentence_words)
-
-            # Reward sentences containing more query terms
-            coverage = len(overlap) / len(query_words)
-
-            # Penalize sentences with very little query relevance
-            if not overlap:
-                continue
-
-            sentence_score = (
-                0.75 * coverage +
-                0.25 * item["score"]
-            )
-
-            candidates.append({
-                "sentence": sentence.strip(),
-                "score": sentence_score,
-                "source": passage_index,
-                "coverage": coverage
-            })
-
-    if not candidates:
-        return None
-
-    # Highest-scoring sentence first
-    candidates.sort(
-        key=lambda x: x["score"],
-        reverse=True
-    )
-
-    # Keep relevant sentences, avoiding duplicates
-    selected = []
-    seen = set()
-
-    for candidate in candidates:
-        sentence = candidate["sentence"]
-
-        if sentence.lower() in seen:
-            continue
-
-        if candidate["coverage"] < 0.15:
-            continue
-
-        selected.append(candidate)
-        seen.add(sentence.lower())
-
-        if len(selected) >= 3:
-            break
-
-    if not selected:
-        return None
-
-    # Return one or more evidence sentences.
-    # This also allows simple cross-passage synthesis.
-    return " ".join(item["sentence"] for item in selected)
-
-
-# --------------------------------------------------
-# 7. Query endpoint
+# 8. Query endpoint
 # --------------------------------------------------
 
 @app.post("/query", response_model=QueryResponse)
@@ -264,10 +305,13 @@ def query(request: QueryRequest):
             confidence=0.0
         )
 
-    # Retrieve relevant passages
-    retrieved = retrieve(question, request.top_k)
+    # Retrieve passages
+    retrieved = retrieve(
+        question,
+        request.top_k
+    )
 
-    if not retrieved:
+    if not retrieved or retrieved[0]["raw_score"] <= 0:
         return QueryResponse(
             answer=None,
             sources=[],
@@ -275,39 +319,59 @@ def query(request: QueryRequest):
             confidence=0.0
         )
 
-    # Extract an answer from the retrieved evidence
-    answer = extract_answer(question, retrieved)
-
-    # Confidence is a retrieval-based estimate, not a
-    # statistically calibrated probability.
-    best_score = retrieved[0]["score"]
-
-    confidence = float(
-        np.clip(best_score, 0.0, 1.0)
+    # Extract answer from evidence
+    answer, supporting_sources = extract_answer(
+        question,
+        retrieved
     )
 
-    # Abstain when retrieval is weak or no answer was found
-    if answer is None or best_score < 0.35:
+    # Calculate a basic confidence estimate
+    best_score = retrieved[0]["score"]
+
+    if answer is None:
+        confidence = 0.0
+    else:
+        confidence = best_score
+
+    # Abstain if there is insufficient evidence
+    if answer is None or best_score < 0.15:
+
         answer = None
-        confidence = min(confidence, 0.30)
+        confidence = 0.0
+        supporting_sources = []
+
+    # Return sources and scores in matching order
+    source_score_map = {
+        item["index"]: item["score"]
+        for item in retrieved
+    }
+
+    ordered_sources = sorted(
+        supporting_sources,
+        key=lambda index: source_score_map[index],
+        reverse=True
+    )
+
+    ordered_scores = [
+        round(source_score_map[index], 4)
+        for index in ordered_sources
+    ]
 
     return QueryResponse(
         answer=answer,
-        sources=[item["index"] for item in retrieved],
-        scores=[
-            round(item["score"], 4)
-            for item in retrieved
-        ],
+        sources=ordered_sources,
+        scores=ordered_scores,
         confidence=round(confidence, 4)
     )
 
 
 # --------------------------------------------------
-# 8. Health-check endpoint
+# 9. Health check
 # --------------------------------------------------
 
 @app.get("/")
 def home():
+
     return {
         "status": "running",
         "message": "RAG Colosseum API is ready",
